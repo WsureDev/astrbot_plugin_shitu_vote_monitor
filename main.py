@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -18,9 +18,21 @@ VOTE_URL = (
     "&web_location=888.148305"
 )
 
-# 数据存储目录和日志文件路径（存放在 data/ 下，插件卸载重装不丢失）
+# 数据存储目录（存放在 data/ 下，插件卸载重装不丢失）
 DATA_DIR = Path("data") / "astrbot_plugin_shitu_vote_monitor"
-LOG_FILE = DATA_DIR / "vote_log.jsonl"
+
+# 每次轮询所有选手的快照（一次轮询 = 一行，含 timestamp）
+# 格式（每行一个 JSON）：
+#   {
+#     "timestamp": 1718000000,          # Unix 秒，Grafana time field
+#     "ts":        "2025-06-19T14:00:00",  # 人类可读，方便直接看日志
+#     "page_total": 27,                  # 本次接口返回的总参赛人数
+#     "items": [
+#       {"title": "是Winter喵", "vote": 37661, "url": "https://live.bilibili.com/..."},
+#       ...
+#     ]
+#   }
+SNAPSHOT_FILE = DATA_DIR / "vote_snapshots.jsonl"
 
 
 def _extract_csrf(cookie: str) -> str:
@@ -61,7 +73,8 @@ class ShituVoteMonitor(Star):
             return
 
         logger.info(
-            f"[shitu_vote] 插件启动，轮询间隔 {self.poll_interval}s，数据写入 {LOG_FILE}"
+            f"[shitu_vote] 插件启动，轮询间隔 {self.poll_interval}s，"
+            f"快照写入 {SNAPSHOT_FILE}"
         )
         self._task = asyncio.create_task(self._poll_loop())
 
@@ -75,16 +88,27 @@ class ShituVoteMonitor(Star):
             try:
                 await self._fetch_and_save()
             except asyncio.CancelledError:
-                # 插件被卸载，正常退出
                 break
             except Exception as e:
                 logger.error(f"[shitu_vote] 轮询出错: {e}")
             await asyncio.sleep(self.poll_interval)
 
     async def _fetch_and_save(self):
-        """请求 B 站排行接口，提取投票数据并追加写入 JSONL 日志文件。"""
+        """
+        请求 B 站排行接口，将一次快照写入 JSONL。
+
+        存储格式（每行一个 JSON 快照）：
+        {
+          "timestamp": <Unix秒, int>,   ← Grafana 时间字段
+          "ts":        <ISO8601, str>,   ← 人类可读
+          "page_total": <int>,
+          "items": [
+            {"title": str, "vote": int, "url": str},
+            ...
+          ]
+        }
+        """
         csrf = _extract_csrf(self.cookie)
-        # csrf 拼到 URL（GET 参数）
         url = VOTE_URL + (f"&csrf={csrf}" if csrf else "")
 
         headers = {
@@ -94,7 +118,6 @@ class ShituVoteMonitor(Star):
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/127.0.0.0 Safari/537.36"
             ),
-            # 与抓包 Referer 保持一致
             "Referer": "https://live.bilibili.com/blackboard/era/eXYVPfN7lWHVt7vY.html",
             "Origin": "https://live.bilibili.com",
         }
@@ -109,55 +132,54 @@ class ShituVoteMonitor(Star):
         code = payload.get("code", -1)
         if code != 0:
             logger.warning(
-                f"[shitu_vote] 接口返回错误: code={code} message={payload.get('message')}"
+                f"[shitu_vote] 接口返回错误: code={code} "
+                f"message={payload.get('message')}"
             )
             return
 
-        # 数据结构: data.items[]
-        # 每条: { item_id, vote, item: { title, jump_url, ... }, ... }
         items_raw: list = payload.get("data", {}).get("items", [])
         if not items_raw:
             logger.warning("[shitu_vote] 接口返回 items 为空")
             return
 
-        # 只保留关键字段：title（选手名）、vote（票数）、jump_url（直播间）
-        items = [
-            {
-                "title": it["item"].get("title", ""),
-                "vote": it.get("vote", 0),
-                "url": it["item"].get("jump_url", ""),
-            }
-            for it in items_raw
-        ]
-
-        # 分页信息（方便后续分析）
         page = payload.get("data", {}).get("page", {})
 
-        record = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "items": items,
+        # 采集时间：同时记录 Unix 时间戳（Grafana 用）和 ISO 字符串（人类可读）
+        now = datetime.now(timezone.utc)
+        snapshot = {
+            "timestamp": int(now.timestamp()),          # Unix 秒，Grafana time field
+            "ts": now.astimezone().isoformat(timespec="seconds"),  # 本地时间 ISO8601
             "page_total": page.get("total", 0),
+            "items": [
+                {
+                    "title": it["item"].get("title", ""),
+                    "vote": it.get("vote", 0),
+                    "url": it["item"].get("jump_url", ""),
+                }
+                for it in items_raw
+            ],
         }
 
-        # 追加写入 JSONL（一行一条记录，便于并发读取最后一行）
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        # 追加写入 JSONL（一行一条快照，独享写/并发读安全）
+        with SNAPSHOT_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
 
         logger.info(
-            f"[shitu_vote] 写入 {len(items)} 条, 总参赛人数 {record['page_total']}, ts={record['ts']}"
+            f"[shitu_vote] 快照写入: {len(snapshot['items'])} 位选手, "
+            f"总人数 {snapshot['page_total']}, ts={snapshot['ts']}"
         )
 
     # ------------------------------------------------------------------ #
-    #  读取最新数据                                                          #
+    #  读取最新快照                                                          #
     # ------------------------------------------------------------------ #
 
     async def _read_latest(self) -> dict | None:
-        """从 JSONL 日志读取最后一条有效记录。"""
-        if not LOG_FILE.exists():
+        """从 JSONL 日志读取最后一条有效快照。"""
+        if not SNAPSHOT_FILE.exists():
             return None
 
         last_line = ""
-        with LOG_FILE.open("r", encoding="utf-8") as f:
+        with SNAPSHOT_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 stripped = line.strip()
                 if stripped:
@@ -169,7 +191,7 @@ class ShituVoteMonitor(Star):
         try:
             return json.loads(last_line)
         except json.JSONDecodeError as e:
-            logger.error(f"[shitu_vote] 解析最新记录失败: {e}")
+            logger.error(f"[shitu_vote] 解析最新快照失败: {e}")
             return None
 
     # ------------------------------------------------------------------ #
@@ -179,27 +201,28 @@ class ShituVoteMonitor(Star):
     @filter.command("rank")
     async def rank(self, event: AstrMessageEvent):
         """查看师徒杯S3实时投票排行（前12名）"""
-        record = await self._read_latest()
+        snapshot = await self._read_latest()
 
-        if record is None:
+        if snapshot is None:
             yield event.plain_result(
                 "暂无数据，请等待首次轮询完成（或检查 Cookie 配置）。"
             )
             return
 
-        # 接口已按票数排序返回，直接用；保险起见再排一次
-        items = sorted(record["items"], key=lambda x: x["vote"], reverse=True)[:12]
-        ts = record.get("ts", "未知")
-        total = record.get("page_total", "?")
+        # 按票数降序，取前 12 条
+        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)[:12]
+        ts = snapshot.get("ts", "未知")
+        total = snapshot.get("page_total", "?")
 
         lines = [
-            f"🏆 师徒杯S3 实时排行 Top12 / 共{total}人 (更新于 {ts})",
+            f"🏆 师徒杯S3 实时排行 Top12 / 共{total}人",
+            f"🕐 更新于 {ts}",
             "─" * 32,
         ]
         medals = ["🥇", "🥈", "🥉"]
         for i, it in enumerate(items, start=1):
             prefix = medals[i - 1] if i <= 3 else f"{i:2d}."
-            name = it["title"][:16]  # 截断超长名字防止排版崩坏
+            name = it["title"][:16]
             vote = it["vote"]
             lines.append(f"{prefix} {name:<18} {vote:>8} 票")
 
