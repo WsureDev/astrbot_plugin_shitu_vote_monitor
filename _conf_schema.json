@@ -1,0 +1,14 @@
+{
+  "bilibili_cookie": {
+    "description": "B 站账号 Cookie",
+    "type": "string",
+    "hint": "用于请求投票接口，格式：SESSDATA=xxx; bili_jct=xxx; ...",
+    "obvious_hint": true
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "hint": "每隔多少秒请求一次接口，建议不低于 30",
+    "default": 30
+  }
+}
