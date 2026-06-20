@@ -9,12 +9,12 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
-# 投票排行接口（固定参数，第一页12条，按票数排序）
+# 投票排行接口（固定参数，第一页最多28条，按票数排序）
 _VOTE_ID = "23ERA1wloghvxay00"
 _GROUP_ID = "24ERA1wloghvtc600"
 VOTE_URL = (
     "https://api.bilibili.com/x/activity_components/vote_new/rank"
-    f"?group_id={_GROUP_ID}&pn=1&ps=12&random_version=&type=2&vote_id={_VOTE_ID}"
+    f"?group_id={_GROUP_ID}&pn=1&ps=28&random_version=&type=2&vote_id={_VOTE_ID}"
     "&web_location=888.148305"
 )
 
@@ -29,10 +29,13 @@ DATA_DIR = Path("data") / "astrbot_plugin_shitu_vote_monitor"
 #     "page_total": 27,                  # 本次接口返回的总参赛人数
 #     "items": [
 #       {"title": "是Winter喵", "vote": 37661, "url": "https://live.bilibili.com/..."},
+#       # 补正选手 title 含补正标注，例如：
+#       {"title": "赵俊日(含补正49k)", "vote": 540234, "url": "https://live.bilibili.com/..."},
 #       ...
 #     ]
 #   }
 SNAPSHOT_FILE = DATA_DIR / "vote_snapshots.jsonl"
+FIX_VOTES_FILE = Path(__file__).resolve().parent / "fix_votes.json"
 
 
 def _extract_csrf(cookie: str) -> str:
@@ -41,11 +44,17 @@ def _extract_csrf(cookie: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _fix_title(title: str, fix_vote: int) -> str:
+    """为补正选手生成带标注的 title，例如 '赵俊日(含补正49k)'。"""
+    fix_k = f"{fix_vote // 1000}k"
+    return f"{title}(含补正{fix_k})"
+
+
 @register(
     "astrbot_plugin_shitu_vote_monitor",
     "WsureDev",
     "定时轮询 B 站师徒杯 S3 投票排行数据，支持 /rank 查看实时榜单。",
-    "0.1.1",
+    "0.1.2",
 )
 class ShituVoteMonitor(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -62,6 +71,37 @@ class ShituVoteMonitor(Star):
 
         # 后台轮询任务句柄
         self._task: asyncio.Task | None = None
+        self.fix_map: dict[str, int] = {}
+        self._load_fix_map()
+
+    def _load_fix_map(self):
+        """加载补正配置，构建 {原始title: fix_vote} 映射。"""
+        self.fix_map = {}
+        if not FIX_VOTES_FILE.exists():
+            logger.warning(f"[shitu_vote] 补正配置不存在: {FIX_VOTES_FILE}")
+            return
+
+        try:
+            data = json.loads(FIX_VOTES_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                raise ValueError("fix_votes.json 顶层必须为数组")
+
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                title = str(it.get("title", "")).strip()
+                try:
+                    fix_vote = int(it.get("fix_vote", 0))
+                except (TypeError, ValueError):
+                    logger.warning(f"[shitu_vote] 非法补正票数配置: {it}")
+                    continue
+                if title and fix_vote > 0:
+                    self.fix_map[title] = fix_vote
+
+            logger.info(f"[shitu_vote] 加载补正配置: {self.fix_map}")
+        except Exception as e:
+            logger.warning(f"[shitu_vote] 加载补正配置失败: {e}")
+            self.fix_map = {}
 
     async def initialize(self):
         """插件初始化：启动后台轮询任务。"""
@@ -104,7 +144,7 @@ class ShituVoteMonitor(Star):
           "page_total": <int>,
           "items": [
             {"title": str, "vote": int, "url": str},
-            ...
+            # 补正选手的 title 已含标注，vote 为补正后总票数
           ]
         }
         """
@@ -146,18 +186,24 @@ class ShituVoteMonitor(Star):
 
         # 采集时间：同时记录 Unix 时间戳（Grafana 用）和 ISO 字符串（人类可读）
         now = datetime.now(timezone.utc)
+        items = []
+        for it in items_raw:
+            raw_title = it["item"].get("title", "")
+            fix_vote = self.fix_map.get(raw_title, 0)
+            # 补正选手：title 写入带标注的名称，vote 写入补正后总票数
+            # 这样 JSONL 无需任何后处理即可直接用于图表
+            title = _fix_title(raw_title, fix_vote) if fix_vote > 0 else raw_title
+            items.append({
+                "title": title,
+                "vote": int(it.get("vote", 0)) + fix_vote,
+                "url": it["item"].get("jump_url", ""),
+            })
+
         snapshot = {
             "timestamp": int(now.timestamp()),          # Unix 秒，Grafana time field
             "ts": now.astimezone().isoformat(timespec="seconds"),  # 本地时间 ISO8601
             "page_total": page.get("total", 0),
-            "items": [
-                {
-                    "title": it["item"].get("title", ""),
-                    "vote": it.get("vote", 0),
-                    "url": it["item"].get("jump_url", ""),
-                }
-                for it in items_raw
-            ],
+            "items": items,
         }
 
         # 追加写入 JSONL（一行一条快照，独享写/并发读安全）
@@ -200,7 +246,7 @@ class ShituVoteMonitor(Star):
 
     @filter.command("rank")
     async def rank(self, event: AstrMessageEvent):
-        """查看师徒杯S3实时投票排行（前12名）"""
+        """查看师徒杯S3实时投票排行（前14名）"""
         snapshot = await self._read_latest()
 
         if snapshot is None:
@@ -209,22 +255,22 @@ class ShituVoteMonitor(Star):
             )
             return
 
-        # 按票数降序，取前 12 条
-        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)[:12]
+        # 按票数降序，取前 14 条
+        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)[:14]
         ts = snapshot.get("ts", "未知")
         total = snapshot.get("page_total", "?")
 
         lines = [
-            f"🏆 师徒杯S3 实时排行 Top12 / 共{total}人",
+            f"🏆 师徒杯S3 实时排行 Top14 / 共{total}人",
             f"🕐 更新于 {ts}",
             "─" * 32,
         ]
         medals = ["🥇", "🥈", "🥉"]
         for i, it in enumerate(items, start=1):
             prefix = medals[i - 1] if i <= 3 else f"{i:2d}."
-            name = it["title"][:16]
+            name = it["title"][:20]
             vote = it["vote"]
-            lines.append(f"{prefix} {name:<18} {vote:>8} 票")
+            lines.append(f"{prefix} {name:<22} {vote:>8} 票")
 
         lines.append("─" * 32)
         lines.append("📈 趋势面板：https://static-host-aetilet6-shitu-vote.sealoshzh.site/")
