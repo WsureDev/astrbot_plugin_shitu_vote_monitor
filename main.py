@@ -226,6 +226,9 @@ class ShituVoteMonitor(Star):
             vote = it["vote"]
             lines.append(f"{prefix} {name:<18} {vote:>8} 票")
 
+        lines.append("─" * 32)
+        lines.append("📈 趋势面板：https://static-host-aetilet6-shitu-vote.sealoshzh.site/")
+
         yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------ #
