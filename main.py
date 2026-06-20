@@ -45,7 +45,7 @@ def _extract_csrf(cookie: str) -> str:
     "astrbot_plugin_shitu_vote_monitor",
     "WsureDev",
     "定时轮询 B 站师徒杯 S3 投票排行数据，支持 /rank 查看实时榜单。",
-    "0.1.0",
+    "0.1.1",
 )
 class ShituVoteMonitor(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
