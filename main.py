@@ -262,7 +262,7 @@ class ShituVoteMonitor(Star):
             fix_vote = int(it.get("fix_vote", 0))
             if fix_vote > 0:
                 fix_k = f"{fix_vote // 1000}k"
-                vote_text = f"{vote}（含补正{fix_k}票）"
+                vote_text = f"{vote:>8}（含补正{fix_k}票）"
             else:
                 vote_text = f"{vote:>8} 票"
             lines.append(f"{prefix} {name:<18} {vote_text}")
