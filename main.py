@@ -29,6 +29,8 @@ DATA_DIR = Path("data") / "astrbot_plugin_shitu_vote_monitor"
 #     "page_total": 27,                  # 本次接口返回的总参赛人数
 #     "items": [
 #       {"title": "是Winter喵", "vote": 37661, "url": "https://live.bilibili.com/..."},
+#       # 补正选手 title 含补正标注，例如：
+#       {"title": "赵俊日(含补正49k)", "vote": 540234, "url": "https://live.bilibili.com/..."},
 #       ...
 #     ]
 #   }
@@ -40,6 +42,12 @@ def _extract_csrf(cookie: str) -> str:
     """从 Cookie 字符串中提取 bili_jct 作为 csrf。"""
     m = re.search(r"bili_jct=([^;]+)", cookie)
     return m.group(1).strip() if m else ""
+
+
+def _fix_title(title: str, fix_vote: int) -> str:
+    """为补正选手生成带标注的 title，例如 '赵俊日(含补正49k)'。"""
+    fix_k = f"{fix_vote // 1000}k"
+    return f"{title}(含补正{fix_k})"
 
 
 @register(
@@ -67,6 +75,7 @@ class ShituVoteMonitor(Star):
         self._load_fix_map()
 
     def _load_fix_map(self):
+        """加载补正配置，构建 {原始title: fix_vote} 映射。"""
         self.fix_map = {}
         if not FIX_VOTES_FILE.exists():
             logger.warning(f"[shitu_vote] 补正配置不存在: {FIX_VOTES_FILE}")
@@ -88,6 +97,8 @@ class ShituVoteMonitor(Star):
                     continue
                 if title and fix_vote > 0:
                     self.fix_map[title] = fix_vote
+
+            logger.info(f"[shitu_vote] 加载补正配置: {self.fix_map}")
         except Exception as e:
             logger.warning(f"[shitu_vote] 加载补正配置失败: {e}")
             self.fix_map = {}
@@ -133,7 +144,7 @@ class ShituVoteMonitor(Star):
           "page_total": <int>,
           "items": [
             {"title": str, "vote": int, "url": str},
-            ...
+            # 补正选手的 title 已含标注，vote 为补正后总票数
           ]
         }
         """
@@ -177,16 +188,16 @@ class ShituVoteMonitor(Star):
         now = datetime.now(timezone.utc)
         items = []
         for it in items_raw:
-            title = it["item"].get("title", "")
-            fix_vote = self.fix_map.get(title, 0)
-            item = {
+            raw_title = it["item"].get("title", "")
+            fix_vote = self.fix_map.get(raw_title, 0)
+            # 补正选手：title 写入带标注的名称，vote 写入补正后总票数
+            # 这样 JSONL 无需任何后处理即可直接用于图表
+            title = _fix_title(raw_title, fix_vote) if fix_vote > 0 else raw_title
+            items.append({
                 "title": title,
                 "vote": int(it.get("vote", 0)) + fix_vote,
                 "url": it["item"].get("jump_url", ""),
-            }
-            if fix_vote > 0:
-                item["fix_vote"] = fix_vote
-            items.append(item)
+            })
 
         snapshot = {
             "timestamp": int(now.timestamp()),          # Unix 秒，Grafana time field
@@ -245,6 +256,7 @@ class ShituVoteMonitor(Star):
             return
 
         # 按票数降序，展示全部（最多 28 条）
+        # title 已含补正标注（写入时已处理），直接展示即可
         items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)
         ts = snapshot.get("ts", "未知")
         total = snapshot.get("page_total", "?")
@@ -257,15 +269,9 @@ class ShituVoteMonitor(Star):
         medals = ["🥇", "🥈", "🥉"]
         for i, it in enumerate(items, start=1):
             prefix = medals[i - 1] if i <= 3 else f"{i:2d}."
-            name = it["title"][:16]
+            name = it["title"][:20]
             vote = it["vote"]
-            fix_vote = int(it.get("fix_vote", 0))
-            if fix_vote > 0:
-                fix_k = f"{fix_vote // 1000}k"
-                vote_text = f"{vote:>8}（含补正{fix_k}票）"
-            else:
-                vote_text = f"{vote:>8} 票"
-            lines.append(f"{prefix} {name:<18} {vote_text}")
+            lines.append(f"{prefix} {name:<22} {vote:>8} 票")
 
         lines.append("─" * 32)
         lines.append("📈 趋势面板：https://static-host-aetilet6-shitu-vote.sealoshzh.site/")
