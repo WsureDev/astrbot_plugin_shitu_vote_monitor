@@ -9,12 +9,12 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
-# 投票排行接口（固定参数，第一页12条，按票数排序）
+# 投票排行接口（固定参数，第一页最多28条，按票数排序）
 _VOTE_ID = "23ERA1wloghvxay00"
 _GROUP_ID = "24ERA1wloghvtc600"
 VOTE_URL = (
     "https://api.bilibili.com/x/activity_components/vote_new/rank"
-    f"?group_id={_GROUP_ID}&pn=1&ps=12&random_version=&type=2&vote_id={_VOTE_ID}"
+    f"?group_id={_GROUP_ID}&pn=1&ps=28&random_version=&type=2&vote_id={_VOTE_ID}"
     "&web_location=888.148305"
 )
 
@@ -33,6 +33,7 @@ DATA_DIR = Path("data") / "astrbot_plugin_shitu_vote_monitor"
 #     ]
 #   }
 SNAPSHOT_FILE = DATA_DIR / "vote_snapshots.jsonl"
+FIX_VOTES_FILE = Path(__file__).resolve().parent / "fix_votes.json"
 
 
 def _extract_csrf(cookie: str) -> str:
@@ -45,7 +46,7 @@ def _extract_csrf(cookie: str) -> str:
     "astrbot_plugin_shitu_vote_monitor",
     "WsureDev",
     "定时轮询 B 站师徒杯 S3 投票排行数据，支持 /rank 查看实时榜单。",
-    "0.1.1",
+    "0.1.2",
 )
 class ShituVoteMonitor(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -62,6 +63,30 @@ class ShituVoteMonitor(Star):
 
         # 后台轮询任务句柄
         self._task: asyncio.Task | None = None
+        self.fix_map: dict[str, int] = {}
+        self._load_fix_map()
+
+    def _load_fix_map(self):
+        self.fix_map = {}
+        if not FIX_VOTES_FILE.exists():
+            logger.warning(f"[shitu_vote] 补正配置不存在: {FIX_VOTES_FILE}")
+            return
+
+        try:
+            data = json.loads(FIX_VOTES_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                raise ValueError("fix_votes.json 顶层必须为数组")
+
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                title = str(it.get("title", "")).strip()
+                fix_vote = int(it.get("fix_vote", 0))
+                if title and fix_vote > 0:
+                    self.fix_map[title] = fix_vote
+        except Exception as e:
+            logger.warning(f"[shitu_vote] 加载补正配置失败: {e}")
+            self.fix_map = {}
 
     async def initialize(self):
         """插件初始化：启动后台轮询任务。"""
@@ -146,18 +171,24 @@ class ShituVoteMonitor(Star):
 
         # 采集时间：同时记录 Unix 时间戳（Grafana 用）和 ISO 字符串（人类可读）
         now = datetime.now(timezone.utc)
+        items = []
+        for it in items_raw:
+            title = it["item"].get("title", "")
+            fix_vote = self.fix_map.get(title, 0)
+            item = {
+                "title": title,
+                "vote": int(it.get("vote", 0)) + fix_vote,
+                "url": it["item"].get("jump_url", ""),
+            }
+            if fix_vote > 0:
+                item["fix_vote"] = fix_vote
+            items.append(item)
+
         snapshot = {
             "timestamp": int(now.timestamp()),          # Unix 秒，Grafana time field
             "ts": now.astimezone().isoformat(timespec="seconds"),  # 本地时间 ISO8601
             "page_total": page.get("total", 0),
-            "items": [
-                {
-                    "title": it["item"].get("title", ""),
-                    "vote": it.get("vote", 0),
-                    "url": it["item"].get("jump_url", ""),
-                }
-                for it in items_raw
-            ],
+            "items": items,
         }
 
         # 追加写入 JSONL（一行一条快照，独享写/并发读安全）
@@ -200,7 +231,7 @@ class ShituVoteMonitor(Star):
 
     @filter.command("rank")
     async def rank(self, event: AstrMessageEvent):
-        """查看师徒杯S3实时投票排行（前12名）"""
+        """查看师徒杯S3实时投票排行（最多28名）"""
         snapshot = await self._read_latest()
 
         if snapshot is None:
@@ -209,13 +240,13 @@ class ShituVoteMonitor(Star):
             )
             return
 
-        # 按票数降序，取前 12 条
-        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)[:12]
+        # 按票数降序，展示全部（最多 28 条）
+        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)
         ts = snapshot.get("ts", "未知")
         total = snapshot.get("page_total", "?")
 
         lines = [
-            f"🏆 师徒杯S3 实时排行 Top12 / 共{total}人",
+            f"🏆 师徒杯S3 实时排行 Top28 / 共{total}人",
             f"🕐 更新于 {ts}",
             "─" * 32,
         ]
@@ -224,7 +255,13 @@ class ShituVoteMonitor(Star):
             prefix = medals[i - 1] if i <= 3 else f"{i:2d}."
             name = it["title"][:16]
             vote = it["vote"]
-            lines.append(f"{prefix} {name:<18} {vote:>8} 票")
+            fix_vote = int(it.get("fix_vote", 0))
+            if fix_vote > 0:
+                fix_k = f"{fix_vote // 1000}k"
+                vote_text = f"{vote}（含补正{fix_k}票）"
+            else:
+                vote_text = f"{vote:>8} 票"
+            lines.append(f"{prefix} {name:<18} {vote_text}")
 
         lines.append("─" * 32)
         lines.append("📈 趋势面板：https://static-host-aetilet6-shitu-vote.sealoshzh.site/")

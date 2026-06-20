@@ -2,7 +2,7 @@ name: astrbot_plugin_shitu_vote_monitor
 display_name: 师徒杯S3投票监控
 desc: 定时轮询 B 站师徒杯 S3 投票排行数据，支持 /rank 查看实时榜单。
 short_desc: 师徒杯S3投票排行监控
-version: v0.1.1
+version: v0.1.2
 author: WsureDev
 repo: https://github.com/WsureDev/astrbot_plugin_shitu_vote_monitor
 astrbot_version: ">=4.5.0"
