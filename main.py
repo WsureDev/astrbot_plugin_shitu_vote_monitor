@@ -246,7 +246,7 @@ class ShituVoteMonitor(Star):
 
     @filter.command("rank")
     async def rank(self, event: AstrMessageEvent):
-        """查看师徒杯S3实时投票排行（最多28名）"""
+        """查看师徒杯S3实时投票排行（前14名）"""
         snapshot = await self._read_latest()
 
         if snapshot is None:
@@ -255,14 +255,13 @@ class ShituVoteMonitor(Star):
             )
             return
 
-        # 按票数降序，展示全部（最多 28 条）
-        # title 已含补正标注（写入时已处理），直接展示即可
-        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)
+        # 按票数降序，取前 14 条
+        items = sorted(snapshot["items"], key=lambda x: x["vote"], reverse=True)[:14]
         ts = snapshot.get("ts", "未知")
         total = snapshot.get("page_total", "?")
 
         lines = [
-            f"🏆 师徒杯S3 实时排行 Top28 / 共{total}人",
+            f"🏆 师徒杯S3 实时排行 Top14 / 共{total}人",
             f"🕐 更新于 {ts}",
             "─" * 32,
         ]
