@@ -81,7 +81,11 @@ class ShituVoteMonitor(Star):
                 if not isinstance(it, dict):
                     continue
                 title = str(it.get("title", "")).strip()
-                fix_vote = int(it.get("fix_vote", 0))
+                try:
+                    fix_vote = int(it.get("fix_vote", 0))
+                except (TypeError, ValueError):
+                    logger.warning(f"[shitu_vote] 非法补正票数配置: {it}")
+                    continue
                 if title and fix_vote > 0:
                     self.fix_map[title] = fix_vote
         except Exception as e:
